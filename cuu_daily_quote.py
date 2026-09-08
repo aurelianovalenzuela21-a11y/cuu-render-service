@@ -169,6 +169,66 @@ def _group_center(boxes):
     return cx, cy
 
 
+def _detect_heads_in_subprocess(image_path, result_queue):
+    """
+    Punto de entrada del PROCESO HIJO: hace todo el trabajo de OpenCV
+    (leer la imagen + detectar cabezas) aislado del proceso principal.
+    """
+    try:
+        import cv2
+        img = cv2.imread(image_path)
+        if img is None:
+            result_queue.put([])
+            return
+        heads = _detect_heads(img)
+        result_queue.put([tuple(int(v) for v in h) for h in heads])
+    except Exception:
+        result_queue.put([])
+
+
+def _detect_heads_isolated(image_path, timeout=8):
+    """
+    Ejecuta la detección de cabezas en un PROCESO separado (no en el mismo
+    proceso de la API, ni en un hilo) por una razón muy concreta: en
+    producción confirmamos que OpenCV puede sufrir un crash nativo real
+    (corrupción de memoria / "Segmentation fault") con ciertas imágenes —
+    algo que NINGÚN try/except de Python puede atrapar, porque no es una
+    excepción, es el sistema operativo matando el proceso completo. Ya se
+    quitó el cascade "upperbody" por ser el sospechoso más claro, pero el
+    crash siguió ocurriendo ocasionalmente incluso solo con los cascades de
+    cara — así que en vez de perseguir cascade por cascade, se aísla TODO
+    el trabajo de OpenCV en un subproceso.
+
+    Si ese subproceso se cae (por cualquier causa nativa) o se cuelga más
+    de `timeout` segundos, aquí simplemente lo tratamos como "no se detectó
+    ninguna cabeza" y el proceso principal de la API sigue vivo y
+    respondiendo con normalidad — el peor caso pasa a ser una foto con el
+    encuadre por default, nunca un servicio caído.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_detect_heads_in_subprocess, args=(image_path, result_queue))
+    proc.start()
+    proc.join(timeout)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return []
+
+    if proc.exitcode != 0:
+        # Crash nativo (segfault u otro) dentro del subproceso — no afectó
+        # al proceso principal, así que seguimos sin cabezas detectadas.
+        return []
+
+    try:
+        return result_queue.get_nowait()
+    except Exception:
+        return []
+
+
 def _reposition_face_above_text(image_path, target_w=1080, target_h=1920,
                                  target_y_frac=_FACE_TARGET_Y_FRAC):
     """
@@ -190,10 +250,10 @@ def _reposition_face_above_text(image_path, target_w=1080, target_h=1920,
         return None, False
 
     try:
-        heads = _detect_heads(img)
+        heads = _detect_heads_isolated(image_path)
     except Exception:
-        # Cualquier falla inesperada en la detección no debe tronar el
-        # render completo — se cae al encuadre por default.
+        # Cualquier falla inesperada (incluso fuera de la detección misma)
+        # no debe tronar el render completo — se cae al encuadre por default.
         heads = []
     if not heads:
         return None, False

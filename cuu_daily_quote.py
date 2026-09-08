@@ -204,10 +204,18 @@ def _detect_heads_isolated(image_path, timeout=8):
     ninguna cabeza" y el proceso principal de la API sigue vivo y
     respondiendo con normalidad — el peor caso pasa a ser una foto con el
     encuadre por default, nunca un servicio caído.
+
+    Se usa el contexto "fork" (no "spawn"): "spawn" arranca un interprete de
+    Python totalmente nuevo y vuelve a importar cv2/numpy desde cero cada
+    vez, lo cual agrega varios segundos por foto y en producción empujó las
+    peticiones al borde de otro timeout (esta vez de red/proxy, no de
+    OpenCV). "fork" clona la memoria del proceso ya vivo — que ya tiene cv2
+    cargado — así que el subproceso arranca casi instantáneo, y sigue
+    aislando cualquier crash nativo del proceso principal igual de bien.
     """
     import multiprocessing as mp
 
-    ctx = mp.get_context("spawn")
+    ctx = mp.get_context("fork")
     result_queue = ctx.Queue()
     proc = ctx.Process(target=_detect_heads_in_subprocess, args=(image_path, result_queue))
     proc.start()

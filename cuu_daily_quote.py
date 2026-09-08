@@ -380,8 +380,18 @@ def _rasterize(html_path, png_path, width, height, scale=1, max_block_height=Non
         # pintar primero con la fuente de respaldo y luego con la webfont ya
         # cargada casi en el mismo frame, dejando un "fantasma" de texto
         # duplicado en la captura (dos tamaños/pesos de letra superpuestos).
+        # IMPORTANTE: este timeout se bajó de 4000ms a 900ms. En producción
+        # (Railway) esta espera casi siempre se agotaba por completo — la
+        # red de salida del contenedor hacia Google Fonts es lenta/variable
+        # — sumando ~4s FIJOS a cada render sin ningún beneficio real (las
+        # fuentes casi siempre ya están listas mucho antes o el CDN no
+        # responde y de nada sirve esperar más). Ese retraso extra fue lo
+        # que empujaba el tiempo total por encima de un límite de conexión
+        # (de Railway o de red) que cortaba la petición antes de que n8n
+        # recibiera la respuesta — aunque el render SÍ terminaba bien del
+        # otro lado (confirmado en los Deploy Logs: 200 OK siempre).
         try:
-            page.wait_for_function("document.fonts.status === 'loaded'", timeout=4000)
+            page.wait_for_function("document.fonts.status === 'loaded'", timeout=900)
         except Exception:
             pass
         # document.fonts.ready puede resolver un frame antes de que Chromium
@@ -393,7 +403,7 @@ def _rasterize(html_path, png_path, width, height, scale=1, max_block_height=Non
             "async () => { await document.fonts.ready; "
             "await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }"
         )
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(150)
 
         if max_block_height:
             # Reduce el tamano de fuente hasta que el bloque de texto quepa dentro

@@ -95,13 +95,22 @@ def _get_cascade(name):
     return _face_cascades[name]
 
 
-def _detect_largest_face(img):
+def _detect_heads(img):
     """
-    Fotos de estudio de grabación suelen venir con luz de ambiente morada/azul
-    y poco contraste, donde el detector de caras "default" con la imagen cruda
-    casi nunca encuentra nada. Probamos varias combinaciones de cascada +
-    preprocesado (ecualizando histograma para el contraste bajo) en orden de
-    confiabilidad, y nos quedamos con la primera que encuentre algo.
+    Detecta TODAS las cabezas humanas visibles en la foto (no solo "la cara
+    más grande"), combinando varios detectores en orden de confiabilidad:
+
+    1. Cara de frente / perfil (varias combinaciones de cascada + preprocesado,
+       incluyendo ecualización de histograma para el contraste bajo típico de
+       luz de ambiente morada/azul en estudio de grabación).
+    2. Si ninguna cara se detecta (cabeza agachada, gorra, ángulo cerrado —
+       casos donde el detector de caras casi nunca encuentra nada), se cae a
+       un detector de cabeza+hombros ("upperbody"), que es mucho más tolerante
+       a esas poses porque no depende de ver los rasgos faciales.
+
+    Devuelve una lista de cajas (x, y, w, h) — puede tener 0, 1 o varias
+    cabezas. Si hay varias, el llamador debe centrar el recorte en el punto
+    medio del grupo completo, no en una sola cabeza.
     """
     import cv2
 
@@ -110,21 +119,58 @@ def _detect_largest_face(img):
     img_w = img.shape[1]
     min_size = max(40, int(img_w * 0.035))
 
-    attempts = [
+    face_attempts = [
         ("haarcascade_frontalface_alt2.xml", gray_eq, 1.05, 4),
         ("haarcascade_frontalface_default.xml", gray_eq, 1.05, 4),
         ("haarcascade_frontalface_alt2.xml", gray, 1.1, 4),
         ("haarcascade_frontalface_default.xml", gray, 1.1, 5),
         ("haarcascade_profileface.xml", gray_eq, 1.05, 4),
+        ("haarcascade_profileface.xml", gray, 1.1, 4),
     ]
-    for cascade_name, gray_img, scale_factor, min_neighbors in attempts:
+    found = []
+    for cascade_name, gray_img, scale_factor, min_neighbors in face_attempts:
         faces = _get_cascade(cascade_name).detectMultiScale(
             gray_img, scaleFactor=scale_factor, minNeighbors=min_neighbors,
             minSize=(min_size, min_size),
         )
-        if len(faces) > 0:
-            return max(faces, key=lambda f: f[2] * f[3])
-    return None
+        found.extend(tuple(f) for f in faces)
+
+    if found:
+        return found
+
+    # Nada de caras detectadas: probamos cabeza+hombros (más tolerante a
+    # cabeza agachada, gorra, perfil cerrado, poca luz en el rostro).
+    body_min_size = max(80, int(img_w * 0.08))
+    for scale_factor, min_neighbors in [(1.05, 3), (1.1, 3)]:
+        bodies = _get_cascade("haarcascade_upperbody.xml").detectMultiScale(
+            gray_eq, scaleFactor=scale_factor, minNeighbors=min_neighbors,
+            minSize=(body_min_size, body_min_size),
+        )
+        if len(bodies) > 0:
+            # De la caja de cabeza+hombros nos interesa solo la parte de
+            # arriba (la cabeza), aproximando con el 35% superior de la caja.
+            heads = [(x, y, w, max(1, int(h * 0.35))) for (x, y, w, h) in bodies]
+            return heads
+
+    return []
+
+
+def _group_center(boxes):
+    """
+    Punto medio del grupo completo de cabezas detectadas: la caja envolvente
+    (bounding box) que cubre TODAS las cabezas, y el centro de esa caja. Con
+    una sola cabeza esto es simplemente su centro; con varias, es el centro
+    del grupo — tal como se pidió: centrar cualquier cabeza, y si hay varias,
+    el centro del grupo.
+    """
+    xs1 = [b[0] for b in boxes]
+    ys1 = [b[1] for b in boxes]
+    xs2 = [b[0] + b[2] for b in boxes]
+    ys2 = [b[1] + b[3] for b in boxes]
+    x1, y1, x2, y2 = min(xs1), min(ys1), max(xs2), max(ys2)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return cx, cy
 
 
 def _reposition_face_above_text(image_path, target_w=1080, target_h=1920,
@@ -147,13 +193,11 @@ def _reposition_face_above_text(image_path, target_w=1080, target_h=1920,
     if img is None:
         return None, False
 
-    face = _detect_largest_face(img)
-    if face is None:
+    heads = _detect_heads(img)
+    if not heads:
         return None, False
 
-    x, y, w, h = face
-    face_cy = y + h / 2.0
-    face_cx = x + w / 2.0
+    face_cx, face_cy = _group_center(heads)
 
     img_h, img_w = img.shape[:2]
     target_aspect = target_w / target_h  # 0.5625
@@ -250,7 +294,7 @@ def render_daily_quote(image_path, lines, out_html, out_png=None, object_positio
     return out_html
 
 
-def _rasterize(html_path, png_path, width, height, scale=2, max_block_height=None, min_font_size=30):
+def _rasterize(html_path, png_path, width, height, scale=1, max_block_height=None, min_font_size=30):
     from playwright.sync_api import sync_playwright
     # En el sandbox de desarrollo Chromium vive en /opt/pw-browsers/chromium;
     # en el contenedor Docker del servicio (imagen oficial de Playwright) usa

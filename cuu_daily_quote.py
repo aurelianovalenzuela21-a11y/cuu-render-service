@@ -79,6 +79,125 @@ def _b64_image(image_path):
         return base64.b64encode(f.read()).decode()
 
 
+# Fracción de la altura del stage (1920px) donde queremos que caiga el CENTRO
+# de la cara detectada. El bloque de texto va centrado en el stage (~top 50%,
+# ocupando aproximadamente del 38% al 62% de alto según cuántas líneas tenga),
+# así que colocamos la cara bien arriba de esa franja, con margen de sobra.
+_FACE_TARGET_Y_FRAC = 0.24
+
+_face_cascades = {}
+
+
+def _get_cascade(name):
+    if name not in _face_cascades:
+        import cv2
+        _face_cascades[name] = cv2.CascadeClassifier(cv2.data.haarcascades + name)
+    return _face_cascades[name]
+
+
+def _detect_largest_face(img):
+    """
+    Fotos de estudio de grabación suelen venir con luz de ambiente morada/azul
+    y poco contraste, donde el detector de caras "default" con la imagen cruda
+    casi nunca encuentra nada. Probamos varias combinaciones de cascada +
+    preprocesado (ecualizando histograma para el contraste bajo) en orden de
+    confiabilidad, y nos quedamos con la primera que encuentre algo.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_eq = cv2.equalizeHist(gray)
+    img_w = img.shape[1]
+    min_size = max(40, int(img_w * 0.035))
+
+    attempts = [
+        ("haarcascade_frontalface_alt2.xml", gray_eq, 1.05, 4),
+        ("haarcascade_frontalface_default.xml", gray_eq, 1.05, 4),
+        ("haarcascade_frontalface_alt2.xml", gray, 1.1, 4),
+        ("haarcascade_frontalface_default.xml", gray, 1.1, 5),
+        ("haarcascade_profileface.xml", gray_eq, 1.05, 4),
+    ]
+    for cascade_name, gray_img, scale_factor, min_neighbors in attempts:
+        faces = _get_cascade(cascade_name).detectMultiScale(
+            gray_img, scaleFactor=scale_factor, minNeighbors=min_neighbors,
+            minSize=(min_size, min_size),
+        )
+        if len(faces) > 0:
+            return max(faces, key=lambda f: f[2] * f[3])
+    return None
+
+
+def _reposition_face_above_text(image_path, target_w=1080, target_h=1920,
+                                 target_y_frac=_FACE_TARGET_Y_FRAC):
+    """
+    Detecta la cara más grande en la foto y recorta/encuadra la imagen a la
+    proporción del stage (1080x1920) de forma que la cara quede SIEMPRE por
+    encima de donde va el texto, en vez de depender de un object-position
+    fijo que no se ajusta a cada foto.
+
+    Devuelve (b64_png, True) si se detectó y recortó una cara, o (None, False)
+    si no se detectó ninguna (en ese caso el llamador debe usar el
+    comportamiento anterior con object_position).
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    img = cv2.imread(image_path)
+    if img is None:
+        return None, False
+
+    face = _detect_largest_face(img)
+    if face is None:
+        return None, False
+
+    x, y, w, h = face
+    face_cy = y + h / 2.0
+    face_cx = x + w / 2.0
+
+    img_h, img_w = img.shape[:2]
+    target_aspect = target_w / target_h  # 0.5625
+
+    # Zoom mínimo para garantizar que, aunque la cara esté muy centrada en la
+    # foto original, siempre haya suficiente "colchón" vertical para
+    # desplazarla hacia arriba sin dejar bordes vacíos.
+    min_extra_zoom = 1.25
+
+    img_aspect = img_w / img_h
+    if img_aspect > target_aspect:
+        # La foto es más ancha que el stage -> se recorta por los lados,
+        # el alto completo ya cabe. Aplicamos el zoom extra igual para tener
+        # margen vertical de sobra.
+        crop_h = img_h / min_extra_zoom
+        crop_w = crop_h * target_aspect
+    else:
+        # La foto es más "alta" que el stage (o igual) -> normalmente se
+        # recorta por arriba/abajo. Damos zoom extra para tener margen.
+        crop_w = img_w / min_extra_zoom
+        crop_h = crop_w / target_aspect
+
+    crop_w = min(crop_w, img_w)
+    crop_h = min(crop_h, img_h)
+
+    # Posición vertical del recorte: queremos que la cara caiga en
+    # target_y_frac de la ALTURA DEL RECORTE (no de la foto completa).
+    desired_top = face_cy - target_y_frac * crop_h
+    top = max(0, min(desired_top, img_h - crop_h))
+
+    # Horizontal: centrado en la cara, sin salirse de los bordes.
+    desired_left = face_cx - crop_w / 2.0
+    left = max(0, min(desired_left, img_w - crop_w))
+
+    box = (int(left), int(top), int(left + crop_w), int(top + crop_h))
+    pil_img = Image.open(image_path).convert("RGB")
+    cropped = pil_img.crop(box).resize((target_w, target_h), Image.LANCZOS)
+
+    import io
+    buf = io.BytesIO()
+    cropped.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode(), True
+
+
 def _render_html(image_b64, lines, object_position, font_size=50):
     # Un solo bloque de texto que fluye y se envuelve de forma natural (nunca se
     # sale de la caja), con spans inline por color en vez de lineas fijas.
@@ -112,8 +231,18 @@ def render_daily_quote(image_path, lines, out_html, out_png=None, object_positio
     max_block_height: si el texto (ya envuelto) mide mas alto que esto en px, el tamano
            de fuente se reduce automaticamente hasta que quepa (o hasta min_font_size).
     """
-    image_b64 = _b64_image(image_path)
-    html = _render_html(image_b64, lines, object_position, font_size)
+    # Intenta recortar/encuadrar la foto según la cara detectada para que
+    # siempre quede arriba del texto. Si no se detecta ninguna cara, se cae
+    # de forma segura al comportamiento anterior (object_position fijo).
+    face_b64, face_found = _reposition_face_above_text(image_path, target_w=1080, target_h=1920)
+    if face_found:
+        image_b64 = face_b64
+        effective_object_position = "50% 50%"  # ya viene recortado exacto
+    else:
+        image_b64 = _b64_image(image_path)
+        effective_object_position = object_position
+
+    html = _render_html(image_b64, lines, effective_object_position, font_size)
     with open(out_html, "w") as f:
         f.write(html)
     if out_png:
@@ -133,7 +262,25 @@ def _rasterize(html_path, png_path, width, height, scale=2, max_block_height=Non
         browser = p.chromium.launch(**launch_kwargs)
         page = browser.new_page(viewport={"width": width, "height": height}, device_scale_factor=scale)
         page.goto("file://" + os.path.abspath(html_path))
-        page.wait_for_timeout(350)
+        # Espera a que las webfonts (Bricolage Grotesque / Space Mono) terminen
+        # de cargar antes de medir o capturar nada — si no, Chromium puede
+        # pintar primero con la fuente de respaldo y luego con la webfont ya
+        # cargada casi en el mismo frame, dejando un "fantasma" de texto
+        # duplicado en la captura (dos tamaños/pesos de letra superpuestos).
+        try:
+            page.wait_for_function("document.fonts.status === 'loaded'", timeout=4000)
+        except Exception:
+            pass
+        # document.fonts.ready puede resolver un frame antes de que Chromium
+        # termine de repintar con la webfont ya aplicada — forzamos dos
+        # vueltas de animation-frame para asegurar que el repintado real ya
+        # ocurrió antes de medir/capturar (si no, la captura puede mezclar
+        # el layout con fuente de respaldo y el layout con la webfont).
+        page.evaluate(
+            "async () => { await document.fonts.ready; "
+            "await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }"
+        )
+        page.wait_for_timeout(300)
 
         if max_block_height:
             # Reduce el tamano de fuente hasta que el bloque de texto quepa dentro

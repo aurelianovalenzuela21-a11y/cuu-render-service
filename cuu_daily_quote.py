@@ -100,13 +100,19 @@ def _detect_heads(img):
     Detecta TODAS las cabezas humanas visibles en la foto (no solo "la cara
     más grande"), combinando varios detectores en orden de confiabilidad:
 
-    1. Cara de frente / perfil (varias combinaciones de cascada + preprocesado,
-       incluyendo ecualización de histograma para el contraste bajo típico de
-       luz de ambiente morada/azul en estudio de grabación).
-    2. Si ninguna cara se detecta (cabeza agachada, gorra, ángulo cerrado —
-       casos donde el detector de caras casi nunca encuentra nada), se cae a
-       un detector de cabeza+hombros ("upperbody"), que es mucho más tolerante
-       a esas poses porque no depende de ver los rasgos faciales.
+    Cara de frente / perfil, con varias combinaciones de cascada +
+    preprocesado (incluyendo ecualización de histograma para el contraste
+    bajo típico de luz de ambiente morada/azul en estudio de grabación), en
+    orden de confiabilidad — se usan TODAS las que encuentren algo.
+
+    NOTA: se probó agregar un cascade de "cabeza+hombros" (upperbody) como
+    respaldo para poses sin cara visible (cabeza agachada, gorra), pero ese
+    cascade concreto resultó tener un bug de memoria nativo en esta versión
+    de OpenCV — corrompe memoria y tumba el proceso completo con
+    "free(): invalid next size" / Segmentation fault, algo que NINGÚN
+    try/except en Python puede atrapar (no es una excepción, es un crash a
+    nivel de proceso). Se quitó por completo; mejor no detectar una cabeza
+    difícil que tumbar el servicio para TODAS las peticiones en curso.
 
     Devuelve una lista de cajas (x, y, w, h) — puede tener 0, 1 o varias
     cabezas. Si hay varias, el llamador debe centrar el recorte en el punto
@@ -142,29 +148,7 @@ def _detect_heads(img):
             continue
         found.extend(tuple(f) for f in faces)
 
-    if found:
-        return found
-
-    # Nada de caras detectadas: probamos cabeza+hombros (más tolerante a
-    # cabeza agachada, gorra, perfil cerrado, poca luz en el rostro).
-    # scaleFactor >= 1.1 evita un bug conocido de OpenCV con este cascade
-    # concreto cuando el paso de escala es muy fino (cerca de 1.0).
-    body_min_size = max(80, int(img_w * 0.08))
-    for scale_factor, min_neighbors in [(1.1, 3), (1.2, 3)]:
-        try:
-            bodies = _get_cascade("haarcascade_upperbody.xml").detectMultiScale(
-                gray_eq, scaleFactor=scale_factor, minNeighbors=min_neighbors,
-                minSize=(body_min_size, body_min_size),
-            )
-        except cv2.error:
-            continue
-        if len(bodies) > 0:
-            # De la caja de cabeza+hombros nos interesa solo la parte de
-            # arriba (la cabeza), aproximando con el 35% superior de la caja.
-            heads = [(x, y, w, max(1, int(h * 0.35))) for (x, y, w, h) in bodies]
-            return heads
-
-    return []
+    return found
 
 
 def _group_center(boxes):

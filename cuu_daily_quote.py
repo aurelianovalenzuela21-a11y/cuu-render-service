@@ -129,10 +129,17 @@ def _detect_heads(img):
     ]
     found = []
     for cascade_name, gray_img, scale_factor, min_neighbors in face_attempts:
-        faces = _get_cascade(cascade_name).detectMultiScale(
-            gray_img, scaleFactor=scale_factor, minNeighbors=min_neighbors,
-            minSize=(min_size, min_size),
-        )
+        try:
+            faces = _get_cascade(cascade_name).detectMultiScale(
+                gray_img, scaleFactor=scale_factor, minNeighbors=min_neighbors,
+                minSize=(min_size, min_size),
+            )
+        except cv2.error:
+            # Algunas combinaciones de cascada/escala pueden disparar un bug
+            # interno de OpenCV con ciertas imágenes (assertion en
+            # cascadedetect.hpp) — se descarta ese intento y se sigue con
+            # el siguiente en vez de tronar toda la petición.
+            continue
         found.extend(tuple(f) for f in faces)
 
     if found:
@@ -140,12 +147,17 @@ def _detect_heads(img):
 
     # Nada de caras detectadas: probamos cabeza+hombros (más tolerante a
     # cabeza agachada, gorra, perfil cerrado, poca luz en el rostro).
+    # scaleFactor >= 1.1 evita un bug conocido de OpenCV con este cascade
+    # concreto cuando el paso de escala es muy fino (cerca de 1.0).
     body_min_size = max(80, int(img_w * 0.08))
-    for scale_factor, min_neighbors in [(1.05, 3), (1.1, 3)]:
-        bodies = _get_cascade("haarcascade_upperbody.xml").detectMultiScale(
-            gray_eq, scaleFactor=scale_factor, minNeighbors=min_neighbors,
-            minSize=(body_min_size, body_min_size),
-        )
+    for scale_factor, min_neighbors in [(1.1, 3), (1.2, 3)]:
+        try:
+            bodies = _get_cascade("haarcascade_upperbody.xml").detectMultiScale(
+                gray_eq, scaleFactor=scale_factor, minNeighbors=min_neighbors,
+                minSize=(body_min_size, body_min_size),
+            )
+        except cv2.error:
+            continue
         if len(bodies) > 0:
             # De la caja de cabeza+hombros nos interesa solo la parte de
             # arriba (la cabeza), aproximando con el 35% superior de la caja.
@@ -193,7 +205,12 @@ def _reposition_face_above_text(image_path, target_w=1080, target_h=1920,
     if img is None:
         return None, False
 
-    heads = _detect_heads(img)
+    try:
+        heads = _detect_heads(img)
+    except Exception:
+        # Cualquier falla inesperada en la detección no debe tronar el
+        # render completo — se cae al encuadre por default.
+        heads = []
     if not heads:
         return None, False
 

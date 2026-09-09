@@ -421,7 +421,19 @@ def _rasterize(html_path, png_path, width, height, scale=1, max_block_height=Non
                 )
             page.wait_for_timeout(80)
 
-        page.screenshot(path=png_path)
+        # La captura se guarda como JPEG (no PNG) para reducir drásticamente
+        # el tamaño de la respuesta HTTP: un PNG de este stage (1080x1920,
+        # foto + degradados) pesa ~1.3-1.4MB sin comprimir; el mismo frame
+        # como JPEG calidad 85 pesa ~150-300KB. Esto se agregó tras confirmar
+        # con evidencia directa (ejecución de n8n) que la conexión se corta
+        # a MITAD de la descarga del cuerpo de la respuesta (aborted:true,
+        # complete:false, con Content-Length de 1.39MB) — es decir, el
+        # cuello de botella es el tamaño/duración de la transferencia de
+        # SALIDA (el PNG), no la subida de la foto de entrada (que ya se
+        # había comprimido antes sin efecto). El nombre de archivo conserva
+        # la extensión .png por compatibilidad con el resto del flujo, pero
+        # el contenido real es JPEG.
+        page.screenshot(path=png_path, type="jpeg", quality=85)
         browser.close()
 
 

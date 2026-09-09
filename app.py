@@ -84,4 +84,7 @@ async def render_daily_quote_endpoint(
     if not os.path.exists(png_path):
         raise HTTPException(status_code=500, detail="El render no generó el PNG esperado.")
 
-    return FileResponse(png_path, media_type="image/png", filename="cuu_studio_frase.png")
+    # El contenido real ahora es JPEG (ver cuu_daily_quote.py._rasterize) para
+    # reducir el tamaño de la respuesta y evitar que la conexión se corte a
+    # mitad de la descarga en redes con problemas para transferencias largas.
+    return FileResponse(png_path, media_type="image/jpeg", filename="cuu_studio_frase.jpg")
